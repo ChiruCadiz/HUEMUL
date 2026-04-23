@@ -1,0 +1,82 @@
+{
+  "name": "huemul",
+  "displayName": "Huemul",
+  "description": "Local AI Copilot powered by Ollama",
+  "version": "0.1.0",
+  "publisher": "huemul",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:huemul.openChat",
+    "onView:huemul.chatView"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Huemul",
+      "properties": {
+        "huemul.ollamaHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "markdownDescription": "Host de Ollama **sin** `http://` ni puerto (ej. `127.0.0.1`, `host.docker.internal`)."
+        },
+        "huemul.ollamaPort": {
+          "type": "number",
+          "default": 11434,
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Puerto HTTP de la API de Ollama (por defecto 11434)."
+        },
+        "huemul.codeColouring": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "**Code colouring** (resaltado de sintaxis) en los bloques de código del chat con Highlight.js. Desactívalo para ver el código como texto plano monocromo."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "huemul.openChat",
+        "title": "Huemul: Open Chat"
+      },
+      {
+        "command": "huemul.openSettings",
+        "title": "Huemul: Ajustes de conexión Ollama"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "huemul-sidebar",
+          "title": "Huemul",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "huemul-sidebar": [
+        {
+          "type": "webview",
+          "id": "huemul.chatView",
+          "name": "Chat",
+          "visibility": "visible"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}
