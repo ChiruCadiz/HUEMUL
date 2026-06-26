@@ -35,6 +35,7 @@ export interface StreamOptions {
   message: string;
   model: string;
   mode: string;
+  files?: Array<{ filename: string; content: string }>;
   signal?: AbortSignal;
 }
 
@@ -228,6 +229,7 @@ export async function chatStream(
         message,
         model,
         mode,
+        files: options.files ?? [],
       }),
       signal,
     });

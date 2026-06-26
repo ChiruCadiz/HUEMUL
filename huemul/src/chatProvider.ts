@@ -13,6 +13,7 @@ import {
 } from "./huemulClient";
 
 const BACKEND_URL = "http://localhost:8000";
+const MAX_FILES_PER_REQUEST = 10;
 
 // Decodifica el payload del JWT sin verificar firma (solo lectura de claims)
 function decodeJwtPayload(token: string): Record<string, unknown> {
@@ -295,6 +296,8 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
           this._activeModel = model;
           await this._context.globalState.update("huemul.activeModel", model);
 
+          const activeFile = getActiveEditorContext();
+
           this._abort?.abort();
           this._abort = new AbortController();
 
@@ -311,6 +314,7 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
                 model,
                 mode: this._activeMode,
                 signal: this._abort.signal,
+                files: activeFile ? [activeFile] : [],  
               },
               (chunk) => {
                 this.postToWebview({ type: "streamToken", text: chunk });
@@ -344,6 +348,110 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
           this._abort?.abort();
           break;
         }
+
+        case "selectFiles": {
+          const uris = await vscode.window.showOpenDialog({
+            canSelectMany: true,
+            canSelectFiles: true,
+            canSelectFolders: false,
+            openLabel: "Agregar al contexto",
+            filters: {
+              "Código": ["ts","js","py","java","cs","cpp","c","h","go","rs","rb","php","swift","kt"],
+              "Configuración": ["json","yaml","yml","toml","ini","env","xml"],
+              "Documentación": ["md","txt","rst"],
+              "Todos los archivos": ["*"],
+            },
+          });
+          if (!uris || uris.length === 0) {
+            return;
+          }
+          const files: Array<{ filename: string; content: string }> = [];
+          for (const uri of uris) {
+            try {
+              const bytes    = await vscode.workspace.fs.readFile(uri);
+              const content  = Buffer.from(bytes).toString("utf-8");
+              const filename = vscode.workspace.asRelativePath(uri, false);
+              files.push({ filename, content });
+            } catch {
+              // Si no se puede leer el archivo, se omite
+            }
+          }
+          if (files.length > MAX_FILES_PER_REQUEST) {
+            files.splice(MAX_FILES_PER_REQUEST);
+            this.postToWebview({
+              type: "warning",
+              text: `Se incluirán solo los primeros ${MAX_FILES_PER_REQUEST} archivos.`,
+            });
+          }
+          if (files.length > 0) {
+          this.postToWebview({ type: "filesSelected", files });
+        }
+        break;
+      }
+      
+      case "includeProject": {
+        if (!this._token || !this._activeSessionId) {
+          return;
+        }
+
+        if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
+          this.postToWebview({
+            type: "warning",
+            text: "No hay carpeta abierta. Usa File → Open Folder para abrir tu proyecto.",
+          });
+          return;
+        }
+
+        const pattern  = "**/*";
+        const excluded = "{**/node_modules/**,**/.git/**,**/out/**,**/dist/**,**/*.min.*,**/*.lock,**/package-lock.json}";
+        const uris = await vscode.workspace.findFiles(pattern, excluded, 50);
+        
+        const files: Array<{ filename: string; content: string }> = [];
+        for (const uri of uris) {
+          try {
+            const bytes   = await vscode.workspace.fs.readFile(uri);
+            const content = Buffer.from(bytes).toString("utf-8");
+            if (content.length > 50000 || _isBinary(content)) {
+              continue;
+            }
+            const filename = vscode.workspace.asRelativePath(uri, false);
+            files.push({ filename, content });
+          } catch {
+      // Si no se puede leer, se omite
+      }
+    }
+    if (files.length > MAX_FILES_PER_REQUEST) {
+      files.splice(MAX_FILES_PER_REQUEST);
+      this.postToWebview({
+        type: "warning",
+        text: `Se incluirán solo los primeros ${MAX_FILES_PER_REQUEST} archivos del proyecto.`,
+      });
+    }
+    try {
+      const res = await fetch(
+        `${BACKEND_URL}/sessions/${this._activeSessionId}/context`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this._token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ files }),
+        }
+      );
+      if (res.ok) {
+        const data = await res.json() as { files_stored: number; files: string[] };
+        this.postToWebview({
+          type: "projectLoaded",
+          count: data.files_stored,
+          files: data.files,
+        });
+      }
+    } catch (e) {
+      this._postError(e);
+    }
+    break;
+  }
 
         default:
           break;
@@ -632,9 +740,11 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
         <textarea id="input" placeholder="Escribe tu mensaje…" rows="3"></textarea>
         <button type="button" id="send">Enviar</button>
       </div>
-      <div style="display:flex;gap:8px;align-items:center;">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
         <button type="button" id="clear" style="font-size:11px;padding:3px 8px;">Limpiar</button>
         <button type="button" id="stop" style="display:none;font-size:11px;padding:3px 8px;">Detener</button>
+        <button type="button" id="selectFilesBtn" style="font-size:11px;padding:3px 8px;" title="Agregar archivos al contexto">📎 Archivos</button>
+        <button type="button" id="includeProjectBtn" style="font-size:11px;padding:3px 8px;" title="Incluir proyecto completo">📁 Proyecto</button>
         <span id="adminOptions" style="display:none;margin-left:auto;">
           <button type="button" id="openSettings" style="font-size:11px;padding:3px 8px;">⚙ Admin</button>
         </span>
@@ -799,6 +909,10 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
     document.getElementById('refreshModels').addEventListener('click', () => vscode.postMessage({ type: 'refreshModels' }));
     document.getElementById('openSettings').addEventListener('click',  () => vscode.postMessage({ type: 'openSettings' }));
 
+
+    document.getElementById('selectFilesBtn').addEventListener('click',    () => vscode.postMessage({ type: 'selectFiles' }));
+    document.getElementById('includeProjectBtn').addEventListener('click', () => vscode.postMessage({ type: 'includeProject' }));
+    
     // ── Chat ──────────────────────────────────────────────────
     function scrollBottom() { chatEl.scrollTop = chatEl.scrollHeight; }
 
@@ -947,6 +1061,18 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
 
         case 'models': setModelOptions(m.names || [], m.activeModel || '', m.error || ''); break;
 
+        case 'filesSelected':
+          appendBubble('assistant', m.files && Array.isArray(m.files) ? 'Se incluyeron ' + m.files.length + ' archivo(s) seleccionados en el contexto.' : 'Archivos añadidos al contexto.');
+          break;
+
+        case 'projectLoaded':
+          appendBubble('assistant', typeof m.count === 'number' ? 'Se cargaron ' + m.count + ' archivo(s) del proyecto.' : 'Proyecto incluido en el contexto.');
+          break;
+
+        case 'warning':
+          appendBubble('assistant', m.text || 'Advertencia', 'error');
+          break;
+
         case 'loading': setLoading(!!m.value); break;
 
         case 'streamStart': {
@@ -988,4 +1114,27 @@ function getNonce(): string {
     text += possible.charAt(Math.floor(Math.random() * possible.length));
   }
   return text;
+}
+
+function _isBinary(content: string): boolean {
+  // Detecta archivos binarios verificando caracteres no imprimibles
+  for (let i = 0; i < Math.min(content.length, 512); i++) {
+    const code = content.charCodeAt(i);
+    if (code === 0 || (code < 32 && code !== 9 && code !== 10 && code !== 13)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getActiveEditorContext(): { filename: string; content: string } | null {
+  const editor = vscode.window.activeTextEditor;
+  const doc = editor?.document;
+  if (!doc) {
+    return null;
+  }
+  return {
+    filename: vscode.workspace.asRelativePath(doc.uri, false) || doc.fileName,
+    content: doc.getText(),
+  };
 }
