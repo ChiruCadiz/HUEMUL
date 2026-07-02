@@ -3,6 +3,8 @@ import { OllamaError } from "./ollamaClient"; // se mantiene para _postError
 import {
   HuemulError,
   login,
+  register,          
+  forgotPassword,
   listModelNames,
   getDefaultModel,
   listSessions,
@@ -10,7 +12,12 @@ import {
   deleteSession,
   chatStream,
   SessionResponse,
+  chatSuggest,
+  chatEdit,
+  EditRequest,
+  changePassword,
 } from "./huemulClient";
+
 
 const BACKEND_URL = "http://localhost:8000";
 const MAX_FILES_PER_REQUEST = 10;
@@ -120,15 +127,67 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
             this._userRole = resp.role;
             this._userEmail = resp.email;
             await this._context.secrets.store("huemul.token", resp.access_token);
+            if (resp.must_change_password) {
+              this.postToWebview({ type: "mustChangePassword" });
+            } else {
+              await this._onLoginSuccess();
+            }
+          } catch (e) {
+            const msg = e instanceof HuemulError ? e.message : e instanceof Error ? e.message : "Error desconocido";
+            this.postToWebview({ type: "loginError", text: msg });
+          }
+          break;
+        }
+
+        case "changePassword": {
+          if (!this._token) return;
+          const currentPwd = String(message.currentPassword ?? "");
+          const newPwd     = String(message.newPassword ?? "");
+          try {
+            const resp = await changePassword(this._token, currentPwd, newPwd, BACKEND_URL);
+            // Actualizar token — el nuevo JWT no tendrá must_change_password
+            const loginResp = await login(this._userEmail, newPwd, BACKEND_URL);
+            this._token = loginResp.access_token;
+            this._userRole = loginResp.role;
+            await this._context.secrets.store("huemul.token", loginResp.access_token);
+            this.postToWebview({ type: "passwordChanged", text: resp.message });
             await this._onLoginSuccess();
           } catch (e) {
-            const msg =
-              e instanceof HuemulError
-                ? e.message
-                : e instanceof Error
-                  ? e.message
-                  : "Error desconocido";
-            this.postToWebview({ type: "loginError", text: msg });
+            const msg = e instanceof HuemulError ? e.message : e instanceof Error ? e.message : "Error desconocido";
+            this.postToWebview({ type: "changePasswordError", text: msg });
+          }
+          break;
+        }
+
+        case "register": {
+          const email = String(message.email ?? "").trim();
+          const password = String(message.password ?? "").trim();
+          if (!email || !password) {
+            this.postToWebview({ type: "registerError", text: "Ingresa correo y contraseña." });
+            return;
+          }
+          try {
+            const resp = await register(email, password, BACKEND_URL);
+            this.postToWebview({ type: "registerSuccess", text: resp.message });
+          } catch (e) {
+            const msg = e instanceof HuemulError ? e.message : e instanceof Error ? e.message : "Error desconocido";
+            this.postToWebview({ type: "registerError", text: msg });
+          }
+          break;
+        }
+
+        case "forgotPassword": {
+          const email = String(message.email ?? "").trim();
+          if (!email) {
+            this.postToWebview({ type: "forgotPasswordResult", text: "Ingresa tu correo." });
+            return;
+          }
+          try {
+            const resp = await forgotPassword(email, BACKEND_URL);
+            this.postToWebview({ type: "forgotPasswordResult", text: resp.message });
+          } catch (e) {
+            const msg = e instanceof HuemulError ? e.message : e instanceof Error ? e.message : "Error desconocido";
+            this.postToWebview({ type: "forgotPasswordResult", text: msg });
           }
           break;
         }
@@ -183,9 +242,16 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
               sessions: this._sessions,
               activeId: this._activeSessionId,
             });
+
+            const autoContext = Boolean(message.autoContext ?? true);
+              if (autoContext) {
+                await this._autoLoadProjectContext(session.id);
+              }
+
           } catch (e) {
             this._postError(e);
           }
+
           break;
         }
 
@@ -453,9 +519,186 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
     break;
   }
 
+        case "adminPanelOpened": {
+          if (!this._token) return;
+          try {
+            const configRes = await fetch(`${BACKEND_URL}/admin/config`, {
+              headers: { Authorization: `Bearer ${this._token}` },
+            });
+            const configData = configRes.ok
+              ? await configRes.json() as { value: string }
+              : { value: "" };
+            const usersRes = await fetch(`${BACKEND_URL}/admin/users`, {
+              headers: { Authorization: `Bearer ${this._token}` },
+            });
+            const users = usersRes.ok
+              ? await usersRes.json() as Array<{ id: number; email: string; role: string }>
+              : [];
+            this.postToWebview({ type: "adminPanelData", systemPrompt: configData.value, users });
+          } catch (e) { this._postError(e); }
+          break;
+        }
+
+        case "saveSystemPrompt": {
+          if (!this._token) return;
+          const value = String(message.value ?? "").trim();
+          try {
+          const res = await fetch(`${BACKEND_URL}/admin/config`, {
+            method: "PUT",
+            headers: { Authorization: `Bearer ${this._token}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ value }),
+          });
+          this.postToWebview({ type: "systemPromptSaved", success: res.ok });
+        } catch {
+          this.postToWebview({ type: "systemPromptSaved", success: false });
+        }
+        break;
+      }
+
+        case "changeUserRole": {
+          if (!this._token) return;
+          const userId = Number(message.userId);
+          const role   = String(message.role ?? "user");
+          try {
+            await fetch(`${BACKEND_URL}/admin/users/${userId}/role?role=${role}`, {
+              method: "PUT",
+              headers: { Authorization: `Bearer ${this._token}` },
+            });
+            this.postToWebview({ type: "userRoleChanged" });
+          } catch (e) { this._postError(e); }
+        break;
+      }
+
+        case "requestSuggest": {
+          if (!this._token || !this._activeSessionId) return;
+          const activeFile = getActiveEditorContext();
+          if (!activeFile) {
+            this.postToWebview({ type: "error", text: "No hay archivo activo para sugerir cambios." });
+            return;
+          }
+          this.postToWebview({ type: "loading", value: true });
+          try {
+            const result = await chatSuggest(this._token, {
+              sessionId: this._activeSessionId,
+              message: String(message.text ?? ""),
+              model: this._activeModel,
+              filename: activeFile.filename,
+              content: activeFile.content,
+            }, BACKEND_URL);
+            if (result.diff) {
+              this.postToWebview({ type: "diffResult", filename: result.filename, diff: result.diff });
+            } else {
+              // El modelo no generó un diff válido — mostrar respuesta cruda
+              this.postToWebview({ type: "assistant", text: result.raw ?? "No se pudo generar un diff." });
+            }
+          } catch (e) { this._postError(e); }
+          finally { this.postToWebview({ type: "loading", value: false }); }
+          break;
+        }
+
+        case "applyDiff": {
+          // Aplica el diff usando WorkspaceEdit
+          const editor = vscode.window.activeTextEditor;
+          if (!editor) {
+            this.postToWebview({ type: "error", text: "No hay archivo activo para aplicar el diff." });
+            return;
+          }
+          const diff = String(message.diff ?? "");
+          const original = editor.document.getText();
+          const newContent = applyUnifiedDiff(original, diff);
+          if (newContent === null) {
+            this.postToWebview({ type: "error", text: "No se pudo aplicar el diff. Intenta con modo edición directa." });
+            return;
+          }
+          const edit = new vscode.WorkspaceEdit();
+          const fullRange = new vscode.Range(
+            editor.document.positionAt(0),
+            editor.document.positionAt(original.length)
+          );
+          edit.replace(editor.document.uri, fullRange, newContent);
+          await vscode.workspace.applyEdit(edit);
+          this.postToWebview({ type: "diffApplied", filename: editor.document.fileName });
+          break;
+        }
+
+        case "requestEdit": {
+          if (!this._token || !this._activeSessionId) return;
+          const activeFile = getActiveEditorContext();
+          if (!activeFile) {
+            this.postToWebview({ type: "error", text: "No hay archivo activo para editar." });
+            return;
+          }
+          this.postToWebview({ type: "loading", value: true });
+          try {
+            const result = await chatEdit(this._token, {
+              sessionId: this._activeSessionId,
+              message: String(message.text ?? ""),
+              model: this._activeModel,
+              filename: activeFile.filename,
+              content: activeFile.content,
+            }, BACKEND_URL);
+            if (result.newContent) {
+              this.postToWebview({
+                type: "editResult",
+                filename: result.filename,
+                newContent: result.newContent,
+                originalContent: activeFile.content,
+              });
+            } else {
+              this.postToWebview({ type: "assistant", text: result.raw ?? "No se pudo generar el archivo editado." });
+            }
+          } catch (e) { this._postError(e); }
+          finally { this.postToWebview({ type: "loading", value: false }); }
+          break;
+        }
+
+        case "applyEdit": {
+          const editor = vscode.window.activeTextEditor;
+          if (!editor) return;
+          const newContent = String(message.newContent ?? "");
+          const edit = new vscode.WorkspaceEdit();
+          edit.replace(
+            editor.document.uri,
+            new vscode.Range(
+              editor.document.positionAt(0),
+              editor.document.positionAt(editor.document.getText().length)
+            ),
+            newContent
+          );
+          await vscode.workspace.applyEdit(edit);
+          this.postToWebview({ type: "editApplied", filename: editor.document.fileName });
+          break;
+        }
+
+        case "createUser": {
+          if (!this._token) return;
+          const email = String(message.email ?? "").trim();
+          const role  = String(message.role ?? "user");
+          try {
+            const res = await fetch(`${BACKEND_URL}/admin/users`, {
+              method: "POST",
+              headers: { Authorization: `Bearer ${this._token}`, "Content-Type": "application/json" },
+              body: JSON.stringify({ email, role }),
+            });
+            const data = await res.json() as { message: string; temp_password?: string };
+            if (res.ok) {
+              this.postToWebview({
+                type: "userCreated",
+                message: data.message,
+                temp_password: data.temp_password,
+              });
+              this.postToWebview({ type: "userRoleChanged" }); // recargar tabla
+            } else {
+              this.postToWebview({ type: "createUserError", text: (data as any).detail ?? "Error al crear usuario." });
+            }
+          } catch (e) { this._postError(e); }
+          break;
+        }
+
         default:
           break;
       }
+
     });
   }
 
@@ -550,6 +793,40 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
     } catch (e) {
       this._postError(e);
     }
+  }
+
+  private async _autoLoadProjectContext(sessionId: string): Promise<void> {
+    if (!this._token) return;
+    if (!vscode.workspace.workspaceFolders?.length) return;
+
+    const pattern  = "**/*";
+    const excluded = "{**/node_modules/**,**/.git/**,**/out/**,**/dist/**,**/*.min.*,**/*.lock,**/package-lock.json}";
+    const uris = await vscode.workspace.findFiles(pattern, excluded, 50);
+
+    const files: Array<{ filename: string; content: string }> = [];
+    for (const uri of uris) {
+      try {
+        const bytes   = await vscode.workspace.fs.readFile(uri);
+        const content = Buffer.from(bytes).toString("utf-8");
+        if (content.length > 50000 || _isBinary(content)) continue;
+        files.push({ filename: vscode.workspace.asRelativePath(uri, false), content });
+      } catch { /* ignorar */ }
+    }
+
+    if (files.length === 0) return;
+    if (files.length > MAX_FILES_PER_REQUEST) files.splice(MAX_FILES_PER_REQUEST);
+
+    try {
+      const res = await fetch(`${BACKEND_URL}/sessions/${sessionId}/context`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this._token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ files }),
+      });
+      if (res.ok) {
+        const data = await res.json() as { files_stored: number; files: string[] };
+        this.postToWebview({ type: "autoContextLoaded", count: data.files_stored, files: data.files });
+      }
+    } catch { /* silencioso */ }
   }
 
   private _postError(e: unknown): void {
@@ -647,6 +924,14 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
     .mode-indicator.edit { background: var(--warn); color: #000; }
     .model-bar { display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap; }
     .model-bar label { font-size: 11px; color: var(--muted); }
+    .context-bar { display: flex; align-items: flex-start; gap: 6px; padding: 5px 10px; border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap; background: var(--vscode-editor-inactiveSelectionBackground, rgba(128,128,128,0.08)); }
+    .context-bar-label { font-size: 11px; color: var(--muted); white-space: nowrap; padding-top: 2px; }
+    .context-file-list { display: flex; flex-wrap: wrap; gap: 4px; flex: 1; }
+    .context-chip { display: inline-flex; align-items: center; gap: 4px; background: var(--asst-bg); border: 1px solid var(--border); border-radius: 3px; padding: 1px 6px; font-size: 11px; color: var(--fg); }
+    .context-chip-remove { cursor: pointer; color: var(--muted); font-size: 12px; line-height: 1; background: none; border: none; padding: 0; }
+    .context-chip-remove:hover { color: var(--err); filter: none; }
+    .context-weight { font-size: 11px; color: var(--muted); white-space: nowrap; padding-top: 2px; }
+    .context-weight.over { color: var(--err); }
     #modelStatus { font-size: 11px; color: var(--muted); }
     #modelStatus.ok { color: var(--green); }
     #modelStatus.warn { color: var(--warn); }
@@ -685,6 +970,16 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
     #modeToast { display: none; position: absolute; bottom: 80px; left: 50%; transform: translateX(-50%); background: var(--asst-bg); border: 1px solid var(--border); padding: 6px 14px; border-radius: 6px; font-size: 12px; color: var(--fg); white-space: nowrap; z-index: 10; }
     @keyframes fadeOut { 0% { opacity: 1; } 70% { opacity: 1; } 100% { opacity: 0; } }
     body { position: relative; }
+    /* ── Diff visual ── */
+    .diff-block { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; margin: 4px 0; }
+    .diff-header { background: var(--asst-bg); padding: 6px 10px; font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+    .diff-lines { max-height: 300px; overflow-y: auto; }
+    .diff-line { padding: 1px 10px; white-space: pre; }
+    .diff-line.added   { background: rgba(0,200,100,0.15); color: #89d185; }
+    .diff-line.removed { background: rgba(220,50,50,0.15);  color: #f88070; }
+    .diff-line.context { color: var(--muted); }
+    .diff-line.hunk    { color: var(--user-bg); background: rgba(14,148,136,0.1); }
+    .diff-actions { display: flex; gap: 6px; margin-top: 6px; }
   </style>
 </head>
 <body>
@@ -692,13 +987,43 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
   <!-- LOGIN -->
   <div id="loginScreen">
     <h2>🦚 Huemul</h2>
-    <p>Ingresa con tu correo universitario para continuar.</p>
-    <input type="email" id="loginEmail" placeholder="usuario@uandresbello.edu" autocomplete="email" />
-    <input type="password" id="loginPassword" placeholder="Contraseña" autocomplete="current-password" />
-    <div id="loginError"></div>
-    <button type="button" id="loginBtn" style="background:var(--user-bg);color:var(--user-fg);border:none;padding:8px;">
-      Iniciar sesión
-    </button>
+
+    <!-- Formulario de login (visible por defecto) -->
+    <div id="loginForm">
+      <p>Ingresa con tu correo universitario para continuar.</p>
+      <input type="email" id="loginEmail" placeholder="usuario@uandresbello.edu" autocomplete="email" />
+      <input type="password" id="loginPassword" placeholder="Contraseña" autocomplete="current-password" />
+      <div id="loginError"></div>
+      <button type="button" id="loginBtn" style="background:var(--user-bg);color:var(--user-fg);border:none;padding:8px;">
+        Iniciar sesión
+      </button>
+      <div style="display:flex;justify-content:space-between;margin-top:8px;font-size:11px;">
+        <a href="#" id="showForgotLink" style="color:var(--user-bg);">¿Olvidaste tu contraseña?</a>
+      </div>
+    </div>
+
+    <!-- Formulario cambio de contraseña obligatorio -->
+    <div id="changePasswordForm" style="display:none;">
+      <p style="color:var(--warn);">⚠️ Debes cambiar tu contraseña temporal antes de continuar.</p>
+      <input type="password" id="currentPassword" placeholder="Contraseña temporal" autocomplete="current-password" />
+      <input type="password" id="newPasswordInput" placeholder="Nueva contraseña (mín. 8 caracteres)" autocomplete="new-password" />
+      <input type="password" id="confirmNewPassword" placeholder="Confirmar nueva contraseña" autocomplete="new-password" />
+      <div id="changePasswordError"></div>
+      <button type="button" id="changePasswordBtn" style="background:var(--user-bg);color:var(--user-fg);border:none;padding:8px;margin-top:4px;">Cambiar contraseña</button>
+    </div>
+
+    <!-- Formulario de recuperación (oculto por defecto) -->
+    <div id="forgotForm" style="display:none;">
+      <p>Ingresa tu correo y te enviaremos un link para restablecer tu contraseña.</p>
+      <input type="email" id="forgotEmail" placeholder="usuario@uandresbello.edu" autocomplete="email" />
+      <div id="forgotResult" style="font-size:12px;color:var(--muted);"></div>
+      <button type="button" id="forgotBtn" style="background:var(--user-bg);color:var(--user-fg);border:none;padding:8px;">
+        Enviar link de recuperación
+      </button>
+      <div style="margin-top:8px;font-size:11px;">
+        <a href="#" id="backToLoginFromForgot" style="color:var(--user-bg);">← Volver al login</a>
+      </div>
+    </div>
   </div>
 
   <!-- MAIN UI -->
@@ -713,8 +1038,11 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
       <select id="sessionSelect"><option value="">(sin sesiones)</option></select>
       <button type="button" class="btn-icon" id="newSessionBtn" title="Nueva sesión">＋</button>
       <button type="button" class="btn-icon" id="deleteSessionBtn" title="Eliminar sesión">🗑</button>
+      <label style="font-size:11px;color:var(--muted);display:flex;align-items:center;gap:3px;" title="Carga contexto al crear sesión">
+        <input type="checkbox" id="autoContextToggle" checked />Auto
+      </label>
     </div>
-    <div class="mode-bar">
+    <div class="mode-bar" id="modeBarContainer">
       <label>Modo</label>
       <div class="mode-toggle">
         <button type="button" class="mode-btn" id="modeAnalysis">Análisis</button>
@@ -729,6 +1057,11 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
       <div class="grow"></div>
       <button type="button" id="refreshModels">Actualizar</button>
     </div>
+    <div class="context-bar" id="contextBar" style="display:none">
+      <span class="context-bar-label">Contexto</span>
+      <div id="contextFileList" class="context-file-list"></div>
+      <span id="contextWeight" class="context-weight"></span>
+    </div>
     <div id="chat" role="log" aria-live="polite"></div>
     <div class="loading-wrap" id="loading">
       <div class="spinner" aria-hidden="true"></div>
@@ -740,6 +1073,16 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
         <textarea id="input" placeholder="Escribe tu mensaje…" rows="3"></textarea>
         <button type="button" id="send">Enviar</button>
       </div>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <span style="font-size:11px;color:var(--muted);">Envío:</span>
+        <div style="display:flex;border:1px solid var(--border);border-radius:4px;overflow:hidden;">
+          <button type="button" id="modeChat"       style="font-size:11px;padding:2px 8px;border:none;border-radius:0;">💬 Chat</button>
+          <button type="button" id="modeSuggest"    style="font-size:11px;padding:2px 8px;border:none;border-radius:0;">🔍 Sugerir</button>
+          <button type="button" id="modeDirectEdit" style="font-size:11px;padding:2px 8px;border:none;border-radius:0;">✏️ Editar</button>
+        </div>
+        <span id="editModeIndicator" style="font-size:11px;color:var(--muted);"></span>
+      </div>
+      </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
         <button type="button" id="clear" style="font-size:11px;padding:3px 8px;">Limpiar</button>
         <button type="button" id="stop" style="display:none;font-size:11px;padding:3px 8px;">Detener</button>
@@ -748,6 +1091,41 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
         <span id="adminOptions" style="display:none;margin-left:auto;">
           <button type="button" id="openSettings" style="font-size:11px;padding:3px 8px;">⚙ Admin</button>
         </span>
+      </div>
+    </div>
+    <!-- Panel admin -->
+    <div id="adminPanel" style="display:none;position:absolute;top:0;left:0;right:0;bottom:0;background:var(--bg);z-index:20;flex-direction:column;overflow-y:auto;">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px;font-weight:bold;background:var(--vscode-sideBarSectionHeader-background,var(--asst-bg));flex-shrink:0;">
+        <span>⚙ Panel de Administración</span>
+        <button type="button" id="closeAdminPanel" class="btn-icon">✕</button>
+      </div>
+      <div style="padding:12px;border-bottom:1px solid var(--border);">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">System Prompt institucional</div>
+        <div id="promptPreview" style="display:none;background:var(--asst-bg);border:1px solid var(--border);border-radius:4px;padding:8px;font-size:12px;white-space:pre-wrap;margin-bottom:6px;max-height:120px;overflow-y:auto;"></div>
+        <textarea id="systemPromptInput" rows="6" style="width:100%;font:inherit;color:var(--fg);background:var(--asst-bg);border:1px solid var(--border);border-radius:4px;padding:6px 8px;resize:vertical;font-size:12px;" placeholder="Escribe el system prompt..."></textarea>
+        <div style="display:flex;gap:8px;margin-top:6px;">
+          <button type="button" id="previewPromptBtn" style="font-size:11px;padding:3px 8px;">Vista previa</button>
+          <button type="button" id="savePromptBtn" style="font-size:11px;padding:3px 8px;background:var(--user-bg);color:var(--user-fg);border:none;">Guardar</button>
+        </div>
+        <div id="promptSaveStatus" style="font-size:11px;margin-top:4px;"></div>
+      <div style="padding:12px;border-top:1px solid var(--border);">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">Crear nuevo usuario</div>
+        <input type="email" id="newUserEmail" placeholder="correo@uandresbello.edu"
+          style="width:100%;padding:6px 8px;font:inherit;color:var(--fg);background:var(--asst-bg);border:1px solid var(--border);border-radius:4px;margin-bottom:6px;" />
+        <select id="newUserRole" style="width:100%;margin-bottom:6px;">
+          <option value="user">Usuario</option>
+          <option value="admin">Administrador</option>
+        </select>
+        <button type="button" id="createUserBtn"
+          style="font-size:11px;padding:3px 10px;background:var(--user-bg);color:var(--user-fg);border:none;">
+          Crear cuenta
+        </button>
+        <div id="createUserResult" style="font-size:11px;margin-top:6px;white-space:pre-wrap;"></div>
+      </div>
+      </div>
+      <div style="padding:12px;">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">Usuarios registrados</div>
+        <div id="userTable" style="font-size:12px;">Cargando…</div>
       </div>
     </div>
     <div id="modeToast"></div>
@@ -786,24 +1164,107 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
     let codeColouringEnabled = true;
     let activeMode = 'analysis';
 
-    // ── Login ─────────────────────────────────────────────────
+    let sendMode = 'chat'; // 'chat' | 'suggest' | 'directEdit'
+
+    function setSendMode(mode) {
+      sendMode = mode;
+      document.getElementById('modeChat').style.background       = mode === 'chat'       ? 'var(--user-bg)' : '';
+      document.getElementById('modeChat').style.color            = mode === 'chat'       ? 'var(--user-fg)' : '';
+      document.getElementById('modeSuggest').style.background    = mode === 'suggest'    ? 'var(--green)'   : '';
+      document.getElementById('modeSuggest').style.color         = mode === 'suggest'    ? '#000'           : '';
+      document.getElementById('modeDirectEdit').style.background = mode === 'directEdit' ? 'var(--warn)'    : '';
+      document.getElementById('modeDirectEdit').style.color      = mode === 'directEdit' ? '#000'           : '';
+      const indicator = document.getElementById('editModeIndicator');
+      indicator.textContent = mode === 'suggest'    ? '🔍 Sugerirá un diff del archivo activo'       :
+                              mode === 'directEdit' ? '✏️ Editará el archivo activo directamente' : '';
+
+      // ── NUEVO: ocultar el selector de Modo cuando no aplica ──
+      const modeBarContainer = document.getElementById('modeBarContainer');
+      modeBarContainer.style.display = mode === 'chat' ? 'flex' : 'none';
+    }
+
+    let contextFiles = [];
+    const MAX_CONTEXT_CHARS = 12000;
+
+    // ── Login / Registro / Recuperación ────────────────────────
+    const loginForm    = document.getElementById('loginForm');
+    const forgotForm   = document.getElementById('forgotForm');
+
+
+    const forgotEmail  = document.getElementById('forgotEmail');
+    const forgotBtn    = document.getElementById('forgotBtn');
+    const forgotResult = document.getElementById('forgotResult');
+
+    function showLoginForm() {
+      loginForm.style.display = 'block';
+      forgotForm.style.display = 'none';
+    }
+    function showForgotForm() {
+      loginForm.style.display = 'none';
+      forgotForm.style.display = 'block';
+      forgotResult.textContent = '';
+    }
+
     function showLogin() {
       loginScreen.style.display = 'flex';
       mainUI.style.display = 'none';
-      loginError.style.display = 'none';
+      showLoginForm();
       loginEmail.value = '';
       loginPassword.value = '';
+      loginError.style.display = 'none';
     }
     function showMain() {
       loginScreen.style.display = 'none';
       mainUI.style.display = 'flex';
     }
+
+    const changePasswordForm  = document.getElementById('changePasswordForm');
+    const currentPasswordEl   = document.getElementById('currentPassword');
+    const newPasswordEl       = document.getElementById('newPassword');
+    const confirmNewPasswordEl = document.getElementById('confirmNewPassword');
+    const changePasswordError = document.getElementById('changePasswordError');
+    const changePasswordBtn   = document.getElementById('changePasswordBtn');
+
+    function showChangePasswordForm() {
+      loginForm.style.display = 'none';
+      forgotForm.style.display = 'none';
+      changePasswordForm.style.display = 'block';
+      changePasswordError.textContent = '';
+    }
+
+    changePasswordBtn.addEventListener('click', () => {
+      const current = currentPasswordEl.value;
+      const newPwd  = newPasswordEl.value;
+      const confirm = confirmNewPasswordEl.value;
+      changePasswordError.textContent = '';
+
+      if (newPwd.length < 8) {
+        changePasswordError.textContent = 'La nueva contraseña debe tener al menos 8 caracteres.';
+        return;
+      }
+      if (newPwd !== confirm) {
+        changePasswordError.textContent = 'Las contraseñas no coinciden.';
+        return;
+      }
+      vscode.postMessage({ type: 'changePassword', currentPassword: current, newPassword: newPwd });
+    });
+
     loginBtn.addEventListener('click', () => {
       loginError.style.display = 'none';
       vscode.postMessage({ type: 'login', email: loginEmail.value.trim(), password: loginPassword.value });
     });
     loginEmail.addEventListener('keydown', (e) => { if (e.key === 'Enter') loginPassword.focus(); });
     loginPassword.addEventListener('keydown', (e) => { if (e.key === 'Enter') loginBtn.click(); });
+
+    document.getElementById('showForgotLink').addEventListener('click', (e) => { e.preventDefault(); showForgotForm(); });
+    document.getElementById('backToLoginFromForgot').addEventListener('click', (e) => { e.preventDefault(); showLoginForm(); });
+
+
+    forgotBtn.addEventListener('click', () => {
+      forgotResult.textContent = 'Enviando…';
+      vscode.postMessage({ type: 'forgotPassword', email: forgotEmail.value.trim() });
+    });
+
     logoutBtn.addEventListener('click', () => {
       if (logoutBtn.dataset.confirming === 'true') {
         logoutBtn.dataset.confirming = 'false';
@@ -840,7 +1301,10 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
         sessionSelect.appendChild(o);
       }
     }
-    newSessionBtn.addEventListener('click', () => vscode.postMessage({ type: 'newSession' }));
+    newSessionBtn.addEventListener('click', () => {
+      const autoCtx = document.getElementById('autoContextToggle');
+      vscode.postMessage({ type: 'newSession', autoContext: autoCtx ? autoCtx.checked : true });
+    });
     deleteSessionBtn.addEventListener('click', () => {
       const sid = sessionSelect.value;
       if (!sid) return;
@@ -881,6 +1345,42 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
       modeToast.style.animation = 'fadeOut 2s forwards';
       setTimeout(() => { modeToast.style.display = 'none'; }, 2000);
     }
+
+    function renderContextBar() {
+    const contextBar      = document.getElementById('contextBar');
+    const contextFileList = document.getElementById('contextFileList');
+    const contextWeight   = document.getElementById('contextWeight');
+    contextFileList.innerHTML = '';
+    if (contextFiles.length === 0) {
+      contextBar.style.display = 'none';
+      return;
+    }
+    contextBar.style.display = 'flex';
+    const totalChars = contextFiles.reduce((sum, f) => sum + (f.content?.length || 0), 0);
+    const pct = Math.round((totalChars / MAX_CONTEXT_CHARS) * 100);
+    contextWeight.textContent = totalChars.toLocaleString() + ' / ' + MAX_CONTEXT_CHARS.toLocaleString() + ' chars (' + pct + '%)';
+    contextWeight.className = 'context-weight' + (totalChars > MAX_CONTEXT_CHARS ? ' over' : '');
+    for (let i = 0; i < contextFiles.length; i++) {
+      const f = contextFiles[i];
+      const chip = document.createElement('span');
+      chip.className = 'context-chip';
+      const name = document.createElement('span');
+      name.textContent = f.filename.split('/').pop();
+      name.title = f.filename;
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'context-chip-remove';
+      removeBtn.textContent = '×';
+      removeBtn.title = 'Quitar ' + f.filename;
+      removeBtn.addEventListener('click', () => {
+        contextFiles.splice(i, 1);
+        renderContextBar();
+      });
+      chip.appendChild(name);
+      chip.appendChild(removeBtn);
+      contextFileList.appendChild(chip);
+    }
+  }
+
     modeAnalysisBtn.addEventListener('click', () => vscode.postMessage({ type: 'changeMode', mode: 'analysis' }));
     modeEditBtn.addEventListener('click',     () => vscode.postMessage({ type: 'changeMode', mode: 'edit' }));
 
@@ -907,12 +1407,42 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
       }
     }
     document.getElementById('refreshModels').addEventListener('click', () => vscode.postMessage({ type: 'refreshModels' }));
-    document.getElementById('openSettings').addEventListener('click',  () => vscode.postMessage({ type: 'openSettings' }));
-
+    
+    document.getElementById('openSettings').addEventListener('click', () => {
+      document.getElementById('adminPanel').style.display = 'flex';
+      vscode.postMessage({ type: 'adminPanelOpened' });
+    });
+    document.getElementById('closeAdminPanel').addEventListener('click', () => {
+      document.getElementById('adminPanel').style.display = 'none';
+    });
+    document.getElementById('previewPromptBtn').addEventListener('click', () => {
+      const preview = document.getElementById('promptPreview');
+      const text = document.getElementById('systemPromptInput').value.trim();
+      if (!text) return;
+      preview.textContent = text;
+      preview.style.display = preview.style.display === 'none' ? 'block' : 'none';
+    });
+    document.getElementById('savePromptBtn').addEventListener('click', () => {
+      const value = document.getElementById('systemPromptInput').value.trim();
+      const status = document.getElementById('promptSaveStatus');
+      if (!value) return;
+      status.textContent = 'Guardando…';
+      status.style.color = 'var(--muted)';
+      vscode.postMessage({ type: 'saveSystemPrompt', value });
+    });
 
     document.getElementById('selectFilesBtn').addEventListener('click',    () => vscode.postMessage({ type: 'selectFiles' }));
     document.getElementById('includeProjectBtn').addEventListener('click', () => vscode.postMessage({ type: 'includeProject' }));
-    
+    document.getElementById('modeChat').addEventListener('click',       () => setSendMode('chat'));
+    document.getElementById('modeSuggest').addEventListener('click',    () => setSendMode('suggest'));
+    document.getElementById('modeDirectEdit').addEventListener('click', () => setSendMode('directEdit'));
+    document.getElementById('createUserBtn').addEventListener('click', () => {
+      const email = document.getElementById('newUserEmail').value.trim();
+      const role  = document.getElementById('newUserRole').value;
+      document.getElementById('createUserResult').textContent = 'Creando…';
+      vscode.postMessage({ type: 'createUser', email, role });
+    });
+
     // ── Chat ──────────────────────────────────────────────────
     function scrollBottom() { chatEl.scrollTop = chatEl.scrollHeight; }
 
@@ -921,7 +1451,13 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
       if (!text) return;
       appendBubble('user', text);
       inputEl.value = '';
-      vscode.postMessage({ type: 'ask', text, model: modelEl.value, mode: activeMode });
+      if (sendMode === 'suggest') {
+        vscode.postMessage({ type: 'requestSuggest', text });
+      } else if (sendMode === 'directEdit') {
+        vscode.postMessage({ type: 'requestEdit', text });
+      } else {
+        vscode.postMessage({ type: 'ask', text, model: modelEl.value, mode: activeMode });
+      }
     }
     sendBtn.addEventListener('click', send);
     clearBtn.addEventListener('click', () => { chatEl.innerHTML = ''; streamingBubble = null; });
@@ -968,7 +1504,7 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
       return null;
     }
     function splitMarkdownFences(text) {
-      const parts = []; const re = /\`\`\`([\\w+-]*)\\n?([\\s\\S]*?)\`\`\`/g;
+      const parts = []; const re = /\u0060\u0060\u0060([\\w+-]*)\\n?([\\s\\S]*?)\u0060\u0060\u0060/g;
       let last = 0, m;
       while ((m = re.exec(text)) !== null) {
         if (m.index > last) parts.push({ type:'text', content:text.slice(last, m.index) });
@@ -1017,6 +1553,37 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    function renderDiff(filename, diffText) {
+      const wrapper = document.createElement('div');
+      const header = document.createElement('div'); header.className = 'diff-header';
+      header.innerHTML = '<span>📄 ' + filename + '</span>';
+      const linesDiv = document.createElement('div'); linesDiv.className = 'diff-lines';
+      for (const line of diffText.split('\\n')) {
+        const div = document.createElement('div');
+        if      (line.startsWith('+') && !line.startsWith('+++')) div.className = 'diff-line added';
+        else if (line.startsWith('-') && !line.startsWith('---')) div.className = 'diff-line removed';
+        else if (line.startsWith('@@'))                           div.className = 'diff-line hunk';
+        else                                                       div.className = 'diff-line context';
+        div.textContent = line;
+        linesDiv.appendChild(div);
+      }
+      const actions = document.createElement('div'); actions.className = 'diff-actions';
+      const applyBtn = document.createElement('button');
+      applyBtn.textContent = '✅ Aplicar cambios';
+      applyBtn.style.cssText = 'font-size:11px;padding:3px 10px;background:var(--green);color:#000;border:none;';
+      applyBtn.addEventListener('click', () => vscode.postMessage({ type: 'applyDiff', diff: diffText }));
+      const rejectBtn = document.createElement('button');
+      rejectBtn.textContent = '❌ Rechazar';
+      rejectBtn.style.cssText = 'font-size:11px;padding:3px 10px;';
+      rejectBtn.addEventListener('click', () => wrapper.remove());
+      actions.appendChild(applyBtn); actions.appendChild(rejectBtn);
+      const block = document.createElement('div'); block.className = 'diff-block';
+      block.appendChild(header); block.appendChild(linesDiv);
+      wrapper.appendChild(block); wrapper.appendChild(actions);
+      const row = document.createElement('div'); row.className = 'row assistant';
+      row.appendChild(wrapper); chatEl.appendChild(row); scrollBottom();
+    }
+
     // ── Mensajes desde extensión ──────────────────────────────
     window.addEventListener('message', (event) => {
       const m = event.data;
@@ -1061,9 +1628,16 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
 
         case 'models': setModelOptions(m.names || [], m.activeModel || '', m.error || ''); break;
 
-        case 'filesSelected':
-          appendBubble('assistant', m.files && Array.isArray(m.files) ? 'Se incluyeron ' + m.files.length + ' archivo(s) seleccionados en el contexto.' : 'Archivos añadidos al contexto.');
+        case 'filesSelected': {
+          const newFiles = m.files || [];
+          for (const f of newFiles) {
+            if (!contextFiles.find(existing => existing.filename === f.filename)) {
+              contextFiles.push(f);
+            }
+          }
+          renderContextBar();
           break;
+        }
 
         case 'projectLoaded':
           appendBubble('assistant', typeof m.count === 'number' ? 'Se cargaron ' + m.count + ' archivo(s) del proyecto.' : 'Proyecto incluido en el contexto.');
@@ -1094,11 +1668,120 @@ export class HuemulChatProvider implements vscode.WebviewViewProvider {
           appendBubble('assistant', m.text || 'Error', 'error');
           streamingBubble = null; break;
 
+        case 'autoContextLoaded': {
+          if (m.count > 0) {
+            const names = (m.files || []).slice(0, 3).join(', ');
+            const more  = m.count > 3 ? ' y ' + (m.count - 3) + ' más' : '';
+            appendBubble('assistant', '📁 Contexto cargado automáticamente: ' + names + more);
+          } 
+          break;
+        }
+
+        case 'adminPanelData': {
+          if (m.systemPrompt) document.getElementById('systemPromptInput').value = m.systemPrompt;
+          const userTable = document.getElementById('userTable');
+          userTable.innerHTML = '';
+          const users = m.users || [];
+          if (!users.length) { userTable.textContent = 'No hay usuarios.'; break; }
+          for (const u of users) {
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border);';
+            const email = document.createElement('span');
+            email.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;';
+            email.textContent = u.email;
+            const role = document.createElement('span');
+            role.style.cssText = 'font-size:11px;color:var(--muted);min-width:50px;';
+            role.textContent = u.role;
+            const btn = document.createElement('button');
+            btn.style.cssText = 'font-size:11px;padding:2px 8px;';
+            btn.textContent = u.role === 'admin' ? 'Degradar' : 'Promover';
+            btn.addEventListener('click', () => {
+              vscode.postMessage({ type: 'changeUserRole', userId: u.id, role: u.role === 'admin' ? 'user' : 'admin' });
+            });
+            row.appendChild(email); row.appendChild(role); row.appendChild(btn);
+            userTable.appendChild(row);
+          }
+          break;
+        }
+
+        case 'systemPromptSaved': {
+          const status = document.getElementById('promptSaveStatus');
+          status.textContent = m.success ? '✅ Guardado.' : '❌ Error al guardar.';
+          status.style.color = m.success ? 'var(--green)' : 'var(--err)';
+          setTimeout(() => { status.textContent = ''; }, 3000);
+          break;
+        }
+
+        case 'userRoleChanged': {
+          vscode.postMessage({ type: 'adminPanelOpened' });
+          break;
+        }
+
+        case 'diffResult': {
+          renderDiff(m.filename, m.diff);
+          break;
+        }
+
+        case 'editResult': {
+          // Aplica el cambio inmediatamente sin pedir confirmación
+          vscode.postMessage({ type: 'applyEdit', newContent: m.newContent });
+          break;
+        }
+
+        case 'diffApplied': {
+          appendBubble('assistant', '✅ Diff aplicado en ' + m.filename + '. Usa Ctrl+Z para deshacer.');
+          break;
+        }
+
+        case 'editApplied': {
+          appendBubble('assistant', '✅ Archivo editado directamente: ' + m.filename + '. Usa Ctrl+Z para deshacer.');
+          break;
+        }
+
+        case 'forgotPasswordResult': {
+          forgotResult.textContent = m.text || '';
+          break;
+        }
+
+        case 'mustChangePassword': {
+          showChangePasswordForm();
+          break;
+        }
+
+        case 'passwordChanged': {
+          // _onLoginSuccess ya fue llamado desde TypeScript
+          break;
+        }
+
+        case 'changePasswordError': {
+          changePasswordError.textContent = m.text || 'Error al cambiar la contraseña.';
+          break;
+        }
+
+        case 'userCreated': {
+        const result = document.getElementById('createUserResult');
+        result.style.color = 'var(--green)';
+        result.textContent = m.message + '\\n\\nContrase\\u00f1a temporal: ' + m.temp_password + '\\n\\nComp\\u00e1rtela al usuario de forma segura. Deber\\u00e1 cambiarla en su primer login.';
+        document.getElementById('newUserEmail').value = '';
+        // Recargar tabla de usuarios
+        vscode.postMessage({ type: 'adminPanelOpened' });
+        break;
+      }
+
+      case 'createUserError': {
+        const result = document.getElementById('createUserResult');
+        result.style.color = 'var(--err)';
+        result.textContent = m.text || 'Error al crear usuario.';
+        break;
+      }
+
         default: break;
       }
     });
 
     setMode('analysis');
+    setSendMode('chat');
+    console.log('HUEMUL SCRIPT LOADED - loginBtn:', document.getElementById('loginBtn'));
     vscode.postMessage({ type: 'ready' });
   </script>
 </body>
@@ -1137,4 +1820,39 @@ function getActiveEditorContext(): { filename: string; content: string } | null 
     filename: vscode.workspace.asRelativePath(doc.uri, false) || doc.fileName,
     content: doc.getText(),
   };
+}
+
+function applyUnifiedDiff(original: string, diff: string): string | null {
+  try {
+    const lines = original.split("\n");
+    const diffLines = diff.split("\n");
+    const result: string[] = [...lines];
+    let offset = 0;
+    for (let i = 0; i < diffLines.length; i++) {
+      const line = diffLines[i];
+      if (line.startsWith("@@")) {
+        const match = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+        if (!match) continue;
+        const origStart = parseInt(match[1]) - 1;
+        let pos = origStart + offset;
+        let j = i + 1;
+        const toRemove: number[] = [];
+        const toAdd: string[] = [];
+        while (j < diffLines.length && !diffLines[j].startsWith("@@")) {
+          const dl = diffLines[j];
+          if (dl.startsWith("-"))      { toRemove.push(pos); pos++; }
+          else if (dl.startsWith("+")) { toAdd.push(dl.slice(1)); }
+          else                          { pos++; }
+          j++;
+        }
+        for (let k = toRemove.length - 1; k >= 0; k--) {
+          result.splice(toRemove[k], 1); offset--;
+        }
+        result.splice(origStart + offset, 0, ...toAdd);
+        offset += toAdd.length;
+        i = j - 1;
+      }
+    }
+    return result.join("\n");
+  } catch { return null; }
 }

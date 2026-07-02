@@ -1,4 +1,4 @@
-// ── Constantes ─────────────────────────────────────────────────
+/// ── Constantes ─────────────────────────────────────────────────
 const DEFAULT_BACKEND_URL = "http://localhost:8000";
 
 // ── Error personalizado ────────────────────────────────────────
@@ -17,6 +17,27 @@ export interface LoginResponse {
   access_token: string;
   role: string;
   email: string;
+  must_change_password: boolean;
+}
+
+export async function changePassword(
+  token: string,
+  currentPassword: string,
+  newPassword: string,
+  backendUrl = DEFAULT_BACKEND_URL
+): Promise<{ message: string }> {
+  let res: Response;
+  try {
+    res = await fetch(`${normalizeBase(backendUrl)}/auth/change-password`, {
+      method: "POST",
+      headers: buildHeaders(token),
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+      }),
+    });
+  } catch (e) { wrapNetworkError(e); }
+  return handleResponse<{ message: string }>(res!);
 }
 
 export interface SessionResponse {
@@ -271,4 +292,99 @@ export async function chatStream(
       onToken(chunk);
     }
   }
+}
+
+export interface EditRequest {
+  sessionId: string;
+  message: string;
+  model: string;
+  filename: string;
+  content: string;
+}
+
+export interface SuggestResponse {
+  filename: string;
+  diff: string | null;
+  raw?: string;
+}
+
+export interface EditResponse {
+  filename: string;
+  newContent: string | null;
+  raw?: string;
+}
+
+export async function chatSuggest(
+  token: string,
+  body: EditRequest,
+  backendUrl = DEFAULT_BACKEND_URL
+): Promise<SuggestResponse> {
+  let res: Response;
+  try {
+    res = await fetch(`${normalizeBase(backendUrl)}/chat/suggest`, {
+      method: "POST",
+      headers: buildHeaders(token),
+      body: JSON.stringify({
+        session_id: body.sessionId,
+        message: body.message,
+        model: body.model,
+        filename: body.filename,
+        content: body.content,
+      }),
+    });
+  } catch (e) { wrapNetworkError(e); }
+  return handleResponse<SuggestResponse>(res!);
+}
+
+export async function chatEdit(
+  token: string,
+  body: EditRequest,
+  backendUrl = DEFAULT_BACKEND_URL
+): Promise<EditResponse> {
+  let res: Response;
+  try {
+    res = await fetch(`${normalizeBase(backendUrl)}/chat/edit`, {
+      method: "POST",
+      headers: buildHeaders(token),
+      body: JSON.stringify({
+        session_id: body.sessionId,
+        message: body.message,
+        model: body.model,
+        filename: body.filename,
+        content: body.content,
+      }),
+    });
+  } catch (e) { wrapNetworkError(e); }
+  return handleResponse<EditResponse>(res!);
+}
+
+export async function register(
+  email: string,
+  password: string,
+  backendUrl = DEFAULT_BACKEND_URL
+): Promise<{ message: string }> {
+  let res: Response;
+  try {
+    res = await fetch(`${normalizeBase(backendUrl)}/auth/register`, {
+      method: "POST",
+      headers: buildHeaders(),
+      body: JSON.stringify({ email, password }),
+    });
+  } catch (e) { wrapNetworkError(e); }
+  return handleResponse<{ message: string }>(res!);
+}
+
+export async function forgotPassword(
+  email: string,
+  backendUrl = DEFAULT_BACKEND_URL
+): Promise<{ message: string }> {
+  let res: Response;
+  try {
+    res = await fetch(`${normalizeBase(backendUrl)}/auth/forgot-password`, {
+      method: "POST",
+      headers: buildHeaders(),
+      body: JSON.stringify({ email }),
+    });
+  } catch (e) { wrapNetworkError(e); }
+  return handleResponse<{ message: string }>(res!);
 }
