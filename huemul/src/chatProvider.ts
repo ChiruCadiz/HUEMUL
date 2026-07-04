@@ -19,7 +19,7 @@ import {
 } from "./huemulClient";
 
 
-const BACKEND_URL = "http://localhost:8000";
+const BACKEND_URL = "http://54.161.75.185";
 const MAX_FILES_PER_REQUEST = 10;
 
 // Decodifica el payload del JWT sin verificar firma (solo lectura de claims)
